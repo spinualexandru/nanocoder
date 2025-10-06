@@ -7,6 +7,7 @@ import {
 	cleanContentFromToolCalls,
 } from '../../tool-calling/index.js';
 import {ConversationStateManager} from '../utils/conversationState.js';
+import {parseFileReferences} from '../../utils/file-reference-parser.js';
 import UserMessage from '../../components/user-message.js';
 import AssistantMessage from '../../components/assistant-message.js';
 import ErrorMessage from '../../components/error-message.js';
@@ -712,13 +713,76 @@ export function useChatHandler({
 	const handleChatMessage = async (message: string) => {
 		if (!client || !toolManager) return;
 
-		// Add user message to chat
+		// Process file references in the message
+		const {processedMessage, fileReferences, includedContent} =
+			parseFileReferences(message);
+
+		// Display file reference errors if any
+		const errorReferences = fileReferences.filter(
+			ref => !ref.exists && ref.error,
+		);
+		if (errorReferences.length > 0) {
+			for (const errorRef of errorReferences) {
+				addToChatQueue(
+					<ErrorMessage
+						key={`file-error-${componentKeyCounter}-${errorRef.originalPattern}`}
+						message={`File reference error: ${errorRef.originalPattern} - ${errorRef.error}`}
+						hideBox={true}
+					/>,
+				);
+			}
+		}
+
+		// Display included files information
+		const validReferences = fileReferences.filter(ref => ref.exists);
+		if (validReferences.length > 0) {
+			const fileNames = validReferences
+				.map(ref => {
+					const lineInfo = ref.startLine
+						? `:${ref.startLine}${ref.endLine ? `-${ref.endLine}` : ''}`
+						: '';
+					return `${ref.filePath}${lineInfo}`;
+				})
+				.join(', ');
+
+			addToChatQueue(
+				<ToolMessage
+					key={`file-inclusion-${componentKeyCounter}`}
+					title={`📎 Included files`}
+					message={`Added context from: ${fileNames}`}
+					hideBox={true}
+				/>,
+			);
+		}
+
+		// Add user message to chat (show processed message for cleaner display)
 		addToChatQueue(
-			<UserMessage key={`user-${componentKeyCounter}`} message={message} />,
+			<UserMessage
+				key={`user-${componentKeyCounter}`}
+				message={processedMessage}
+			/>,
 		);
 
-		// Add user message to conversation history
-		const userMessage: Message = {role: 'user', content: message};
+		// Build enhanced message content with file contents
+		let enhancedContent = processedMessage;
+		if (includedContent.length > 0) {
+			const fileContents = includedContent
+				.map((content, index) => {
+					const ref = validReferences[index];
+					const lineInfo = ref?.startLine
+						? ` (lines ${ref.startLine}${ref.endLine ? `-${ref.endLine}` : ''})`
+						: '';
+					return `\n\n---\nFile: ${
+						ref?.filePath || 'unknown'
+					}${lineInfo}\n\`\`\`\n${content}\n\`\`\``;
+				})
+				.join('');
+
+			enhancedContent = processedMessage + fileContents;
+		}
+
+		// Add enhanced user message to conversation history
+		const userMessage: Message = {role: 'user', content: enhancedContent};
 		const updatedMessages = [...messages, userMessage];
 		setMessages(updatedMessages);
 

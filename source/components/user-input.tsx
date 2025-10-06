@@ -7,7 +7,8 @@ import {commandRegistry} from '../commands.js';
 import {useTerminalWidth} from '../hooks/useTerminalWidth.js';
 import {useUIStateContext} from '../hooks/useUIState.js';
 import {useInputState} from '../hooks/useInputState.js';
-import {Completion} from '../types/index.js';
+import {Completion, CompletionTypes} from '../types/index.js';
+import {getFileSuggestions} from '../utils/file-reference-parser.js';
 
 interface ChatProps {
 	onSubmit?: (message: string) => void;
@@ -19,7 +20,7 @@ interface ChatProps {
 
 export default function UserInput({
 	onSubmit,
-	placeholder = 'Type `/` and then press Tab for command suggestions or `!` to execute bash commands. Use ↑/↓ for history.',
+	placeholder = 'Type `/` for commands, @filename.ts to include files, or `!` for bash. Use Tab for completion.',
 	customCommands = [],
 	disabled = false,
 	onCancel,
@@ -55,6 +56,13 @@ export default function UserInput({
 		resetUIState,
 	} = uiState;
 
+	// State for completion navigation
+	const [selectedCompletionIndex, setSelectedCompletionIndex] = useState(0);
+	const [completionType, setCompletionType] = useState<
+		'command' | 'file' | null
+	>(null);
+	const [justCompleted, setJustCompleted] = useState(false);
+
 	// Check if we're in bash mode (input starts with !)
 	const isBashMode = input.trim().startsWith('!');
 
@@ -88,13 +96,106 @@ export default function UserInput({
 				// Force TextInput to remount by changing its key, which resets cursor position
 				updateInput(completedText);
 				setTextInputKey(prev => prev + 1);
+				setShowCompletions(false);
+				setCompletions([]);
+				setCompletionType(null);
 			} else if (allCompletions.length > 1) {
 				// Show completions when there are multiple matches
 				setCompletions(allCompletions);
 				setShowCompletions(true);
+				setSelectedCompletionIndex(0);
+				setCompletionType('command');
 			}
 		},
 		[customCommands, setCompletions, setShowCompletions, updateInput],
+	);
+
+	// File completion logic for @ syntax
+	const handleFileCompletion = useCallback(
+		(partialPath: string) => {
+			const suggestions = getFileSuggestions(partialPath);
+
+			if (suggestions.length === 1) {
+				// Auto-complete when there's exactly one match
+				const completedText = `@${suggestions[0]}`;
+				updateInput(completedText);
+				setTextInputKey(prev => prev + 1);
+				setShowCompletions(false);
+				setCompletions([]);
+				setCompletionType(null);
+			} else if (suggestions.length > 1) {
+				// Show file suggestions when there are multiple matches
+				const fileCompletions: Completion[] = suggestions.map(suggestion => ({
+					name: suggestion,
+					isCustom: false,
+				}));
+				setCompletions(fileCompletions);
+				setShowCompletions(true);
+				setSelectedCompletionIndex(0);
+				setCompletionType('file');
+			}
+		},
+		[setCompletions, setShowCompletions, updateInput],
+	);
+
+	// Apply selected completion
+	const applySelectedCompletion = useCallback(() => {
+		if (
+			completions.length === 0 ||
+			selectedCompletionIndex >= completions.length
+		)
+			return;
+
+		const selectedCompletion = completions[selectedCompletionIndex];
+		let completedText: string;
+
+		if (completionType === 'command') {
+			completedText = `/${selectedCompletion.name}`;
+		} else if (completionType === 'file') {
+			// For file completion, we need to replace the part after @
+			const atIndex = input.lastIndexOf('@');
+			const beforeAt = input.slice(0, atIndex);
+			completedText = `${beforeAt}@${selectedCompletion.name}`;
+		} else {
+			return;
+		}
+
+		updateInput(completedText);
+		setTextInputKey(prev => prev + 1);
+		setShowCompletions(false);
+		setCompletions([]);
+		setSelectedCompletionIndex(0);
+		setCompletionType(null);
+		setJustCompleted(true);
+
+		// Clear the justCompleted flag after a short delay
+		setTimeout(() => setJustCompleted(false), 200);
+	}, [
+		completions,
+		selectedCompletionIndex,
+		completionType,
+		input,
+		updateInput,
+		setShowCompletions,
+		setCompletions,
+	]);
+
+	// Navigate completion options
+	const navigateCompletions = useCallback(
+		(direction: 'up' | 'down') => {
+			if (!showCompletions || completions.length === 0) return;
+
+			if (direction === 'up') {
+				setSelectedCompletionIndex(prev =>
+					prev === 0 ? completions.length - 1 : prev - 1,
+				);
+			} else {
+				setSelectedCompletionIndex(prev =>
+					prev === completions.length - 1 ? 0 : prev + 1,
+				);
+			}
+		},
+		[showCompletions, completions.length],
 	);
 
 	// Handle form submission
@@ -106,8 +207,20 @@ export default function UserInput({
 			resetInput();
 			resetUIState();
 			promptHistory.resetIndex();
+			// Reset completion state
+			setShowCompletions(false);
+			setCompletions([]);
+			setSelectedCompletionIndex(0);
+			setCompletionType(null);
 		}
-	}, [input, onSubmit, resetInput, resetUIState]);
+	}, [
+		input,
+		onSubmit,
+		resetInput,
+		resetUIState,
+		setShowCompletions,
+		setCompletions,
+	]);
 
 	// Handle escape key logic
 	const handleEscape = useCallback(() => {
@@ -184,8 +297,17 @@ export default function UserInput({
 
 		// Handle special keys
 		if (key.escape) {
-			handleEscape();
-			return;
+			if (showCompletions) {
+				// Cancel completions first
+				setShowCompletions(false);
+				setCompletions([]);
+				setSelectedCompletionIndex(0);
+				setCompletionType(null);
+				return;
+			} else {
+				handleEscape();
+				return;
+			}
 		}
 
 		if (key.ctrl && inputChar === 'b') {
@@ -195,16 +317,42 @@ export default function UserInput({
 			return;
 		}
 
-		if (key.tab && input.startsWith('/')) {
-			const commandPrefix = input.slice(1).split(' ')[0];
-			handleCommandCompletion(commandPrefix);
-			return;
+		if (key.tab) {
+			if (showCompletions) {
+				// If completions are shown, apply the selected one
+				applySelectedCompletion();
+				return;
+			} else if (input.startsWith('/')) {
+				const commandPrefix = input.slice(1).split(' ')[0];
+				handleCommandCompletion(commandPrefix);
+				return;
+			} else if (input.includes('@')) {
+				// Find the last @ and complete file path
+				const atIndex = input.lastIndexOf('@');
+				const partialPath = input.slice(atIndex + 1);
+				handleFileCompletion(partialPath);
+				return;
+			}
 		}
 
-		// Clear UI state on other input
-		if (showCompletions) {
+		// Clear justCompleted flag when user starts typing
+		if (
+			justCompleted &&
+			inputChar &&
+			!key.tab &&
+			!key.upArrow &&
+			!key.downArrow &&
+			!key.escape
+		) {
+			setJustCompleted(false);
+		}
+
+		// Only clear completions on specific keys that would cancel them
+		if (showCompletions && (key.return || key.ctrl || key.meta)) {
 			setShowCompletions(false);
 			setCompletions([]);
+			setSelectedCompletionIndex(0);
+			setCompletionType(null);
 		}
 		if (showClearMessage) {
 			setShowClearMessage(false);
@@ -219,15 +367,59 @@ export default function UserInput({
 
 		// Handle navigation
 		if (key.upArrow) {
-			handleHistoryNavigation('up');
-			return;
+			if (showCompletions) {
+				navigateCompletions('up');
+				return;
+			} else {
+				handleHistoryNavigation('up');
+				return;
+			}
 		}
 
 		if (key.downArrow) {
-			handleHistoryNavigation('down');
-			return;
+			if (showCompletions) {
+				navigateCompletions('down');
+				return;
+			} else {
+				handleHistoryNavigation('down');
+				return;
+			}
 		}
 	});
+
+	// Helper function to highlight @ file references in input
+	const highlightFileReferences = (text: string) => {
+		if (!text) return text;
+
+		const parts = text.split(/(@[^\s@:]+(?:\.[^\s@:]*)*(?::\d+(?:-\d+)?)?)/g);
+
+		return parts.map((part, index) => {
+			if (part.startsWith('@')) {
+				return (
+					<Text key={index} color={colors.info} bold underline>
+						{part}
+					</Text>
+				);
+			}
+			return part;
+		});
+	};
+
+	// Helper function to highlight placeholder text
+	const highlightPlaceholder = (text: string) => {
+		const parts = text.split(/(@[^\s@]+)/g);
+
+		return parts.map((part, index) => {
+			if (part.startsWith('@')) {
+				return (
+					<Text key={index} color={colors.info} bold>
+						{part}
+					</Text>
+				);
+			}
+			return part;
+		});
+	};
 
 	// Render function - NEVER modifies state, only for display
 	const renderDisplayContent = () => {
@@ -243,7 +435,7 @@ export default function UserInput({
 			);
 		}
 
-		return input;
+		return highlightFileReferences(input);
 	};
 
 	const textColor = disabled || !input ? colors.secondary : colors.primary;
@@ -277,7 +469,18 @@ export default function UserInput({
 						<Text color={textColor}>{'>'} </Text>
 						{disabled ? (
 							<Text color={colors.secondary}>...</Text>
+						) : showCompletions || !isFocused || justCompleted ? (
+							// Show highlighted input when:
+							// - Completions are active, OR
+							// - Input is not focused, OR
+							// - Just completed a selection (briefly show highlighting)
+							<Text color={textColor}>
+								{input
+									? highlightFileReferences(input)
+									: highlightPlaceholder(placeholder)}
+							</Text>
 						) : (
+							// Normal TextInput when focused and no special conditions
 							<TextInput
 								key={textInputKey}
 								value={input}
@@ -295,6 +498,11 @@ export default function UserInput({
 						Bash Mode
 					</Text>
 				)}
+				{showCompletions && (
+					<Text color={colors.info} dimColor>
+						Tab Completion Mode - Use ↑/↓ to navigate, Tab to select
+					</Text>
+				)}
 				{showClearMessage && (
 					<Text color={colors.secondary} dimColor>
 						Press escape again to clear
@@ -302,15 +510,34 @@ export default function UserInput({
 				)}
 				{showCompletions && completions.length > 0 && (
 					<Box flexDirection="column" marginTop={1}>
-						<Text color={colors.secondary}>Available commands:</Text>
-						{completions.map((completion, index) => (
-							<Text
-								key={index}
-								color={completion.isCustom ? colors.info : colors.primary}
-							>
-								/{completion.name}
-							</Text>
-						))}
+						<Text color={colors.secondary}>
+							{completionType === CompletionTypes.File
+								? 'Available files:'
+								: 'Available commands:'}
+						</Text>
+						{completions.map((completion, index) => {
+							const isSelected = index === selectedCompletionIndex;
+							const prefix =
+								completionType === CompletionTypes.File ? '@' : '/';
+							const isDirectory =
+								completionType === CompletionTypes.File &&
+								completion.name.endsWith('/');
+							const icon = isDirectory ? '📁' : '📄';
+							return (
+								<Text
+									key={index}
+									color={completion.isCustom ? colors.info : colors.primary}
+									backgroundColor={isSelected ? colors.secondary : undefined}
+									bold={isSelected}
+								>
+									{icon} {prefix}
+									{completion.name}
+								</Text>
+							);
+						})}
+						<Text color={colors.secondary} dimColor>
+							Use ↑/↓ to navigate, Tab to select, Esc to cancel
+						</Text>
 					</Box>
 				)}
 			</Box>
